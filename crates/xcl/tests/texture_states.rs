@@ -110,3 +110,92 @@ fn uploads_start_from_each_subresources_state() {
         assert!(!wrong.is_empty(), "the debug layer did not see a transition from the wrong state – the check above proves nothing");
     }
 }
+
+/// A batch of uploads into two textures, each with mips in different states (#104, batch
+/// path): the barriers record start from each subresource's own state, so the debug layer
+/// sees no error and each subresource is left in its own state. One state for all of a
+/// texture's subresources – what uploads did before – is the regression this is checked
+/// against.
+#[test]
+fn batch_uploads_start_from_each_subresources_state() {
+    unsafe {
+        match xcl::gpu::agility::configuration_interface::<ID3D12Debug>(&CLSID_D3D12Debug) {
+            Ok(d) => d.EnableDebugLayer(),
+            Err(e) => {
+                println!("SKIPPED batch_uploads_start_from_each_subresources_state: no D3D12 debug layer ({e})");
+                return;
+            }
+        }
+        let Ok(dev) = xcl::gpu::agility::create_device(None, D3D_FEATURE_LEVEL_11_0) else {
+            println!("SKIPPED batch_uploads_start_from_each_subresources_state: no GPU");
+            return;
+        };
+        let Ok(q) = dev.cast::<ID3D12InfoQueue>() else {
+            println!("SKIPPED batch_uploads_start_from_each_subresources_state: the device has no debug layer");
+            return;
+        };
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let mips = 4u16;
+        let rd = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: mips,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        let mut resources = Vec::new();
+        for _ in 0..2 {
+            let mut r: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut r).unwrap();
+            resources.push(r.unwrap());
+        }
+        // each texture is made in COPY_DEST and left in the shader-resource states; mip 1 is
+        // in COPY_SOURCE, mip 2 in COPY_DEST
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+        for r in &resources {
+            list.ResourceBarrier(&[transition(r, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, SRV)]);
+            list.ResourceBarrier(&[transition(r, 1, SRV, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.ResourceBarrier(&[transition(r, 2, SRV, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+        list.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        texture::wait(&dev, &queue).unwrap();
+        let setup = errors(&q);
+        assert!(setup.is_empty(), "setup: {setup:?}");
+
+        let subs_v = |v: u8| -> Vec<Subresource> {
+            (0..mips as usize).map(|m| Subresource { rows: 64 >> m, row_bytes: (64 >> m) * 4, depth: 1, data: vec![v; (64 >> m) * (64 >> m) * 4] }).collect()
+        };
+        let per_subresource_states: Vec<D3D12_RESOURCE_STATES> = vec![
+            SRV,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            SRV,
+        ];
+        let up = |states: Vec<D3D12_RESOURCE_STATES>, v: u8| {
+            let items = resources.iter().map(|r| (r.clone(), subs_v(v), states.clone())).collect::<Vec<_>>();
+            texture::upload_batch(&dev, &queue, &items)
+        };
+
+        // each subresource's state, in the batch: no error, and it is left in it
+        let batch_failures = up(per_subresource_states.clone(), 2).unwrap();
+        assert!(batch_failures.is_empty(), "the batch's uploads failed: {batch_failures:?}");
+        let right = errors(&q);
+        println!("batch per-subresource states: {} debug-layer errors", right.len());
+        assert!(right.is_empty(), "uploads with each subresource's state: {right:?}");
+        let again = up(per_subresource_states, 3).unwrap();
+        assert!(again.is_empty(), "the second upload failed: {again:?}");
+        assert!(errors(&q).is_empty(), "the upload did not leave the subresources in their states");
+
+        // one state for all of every texture's subresources, as uploads did before
+        let wrong = up(vec![SRV; mips as usize], 4).unwrap();
+        assert!(wrong.is_empty(), "the batch's uploads failed: {wrong:?}");
+        let wrong = errors(&q);
+        println!("batch one state for all: {} debug-layer errors, first: {:?}", wrong.len(), wrong.first());
+        assert!(!wrong.is_empty(), "the debug layer did not see a transition from the wrong state – the check above proves nothing");
+    }
+}
